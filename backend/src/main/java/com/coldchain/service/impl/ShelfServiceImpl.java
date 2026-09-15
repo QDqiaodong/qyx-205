@@ -25,6 +25,7 @@ import com.coldchain.repository.ShelfWeightSum;
 import com.coldchain.service.ShelfService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -125,22 +126,35 @@ public class ShelfServiceImpl implements ShelfService {
     @Override
     @Transactional
     public void deleteShelf(Long id) {
-        // 持货架行锁，与落架/下架互斥；有在架托盘时禁止删除，避免托盘变孤儿、承重对不上
+        // 锁序与绑定/解绑/重分配一致：先锁货架行，再锁编码行
         Shelf shelf = shelfRepository.findByIdForUpdate(id)
                 .orElseThrow(() -> new BusinessException("货架不存在"));
 
+        // 持货架行锁，与落架/下架互斥；有在架托盘时禁止删除，避免托盘变孤儿、承重对不上
         long activeCount = palletActiveRepository.countByShelfId(id);
         if (activeCount > 0) {
             throw new BusinessException("货架上还有 " + activeCount + " 托在架托盘，请先全部下架并退回承重后再删除");
         }
 
+        // 普通读在拿到货架锁之后才发生：能改动本架绑定的事务都必须先拿本架锁，此刻已全部提交，可见
         LocationCode locationCode = locationCodeRepository.findByShelfId(id).orElse(null);
         if (locationCode != null) {
-            locationCode.setShelfId(null);
-            locationCode.setStatus(1);
-            locationCodeRepository.save(locationCode);
+            // 编码行仍需加锁：另一货架的重分配事务只需“对方货架锁+本编码锁”就能把它迁走，
+            // 锁内复核归属，若已被迁到别架则不得清空，避免误解绑别人的新绑定
+            List<LocationCode> locked = locationCodeRepository
+                    .findByIdsForUpdateOrderByIdAsc(List.of(locationCode.getId()));
+            locationCode = locked.stream()
+                    .filter(c -> id.equals(c.getShelfId()))
+                    .findFirst()
+                    .orElse(null);
+            if (locationCode != null) {
+                locationCode.setShelfId(null);
+                locationCode.setStatus(1);
+                locationCodeRepository.save(locationCode);
 
-            saveChangeLog(shelf.getId(), shelf.getShelfNo(), locationCode.getCode(), null, OPERATION_UNBIND, "system", "删除货架自动解绑");
+                saveChangeLog(shelf.getId(), shelf.getShelfNo(), locationCode.getCode(), null,
+                        OPERATION_UNBIND, "system", "删除货架自动解绑");
+            }
         }
 
         shelfRepository.delete(shelf);
@@ -150,32 +164,57 @@ public class ShelfServiceImpl implements ShelfService {
     @Override
     @Transactional
     public ShelfResponse bindCode(CodeBindRequest request) {
-        Shelf shelf = shelfRepository.findById(request.getShelfId())
+        String code = request.getCode();
+
+        // 1) 先锁目标货架行：同一货架的绑定/解绑/重分配/落架全部在此串行。
+        //    本事务此前没有任何普通查询，拿到货架锁后的第一次普通读才建立一致性快照，
+        //    因此必然看到所有先前已提交的本架改码事务。
+        Shelf shelf = shelfRepository.findByIdForUpdate(request.getShelfId())
                 .orElseThrow(() -> new BusinessException("货架不存在"));
 
-        LocationCode existingCode = locationCodeRepository.findByShelfId(request.getShelfId()).orElse(null);
-        if (existingCode != null) {
-            throw new BusinessException("货架已绑定货位编码: " + existingCode.getCode());
+        LocationCode currentOnShelf = locationCodeRepository.findByShelfId(shelf.getId()).orElse(null);
+        if (currentOnShelf != null) {
+            throw new BusinessException("货架已绑定货位编码: " + currentOnShelf.getCode());
         }
 
-        LocationCode locationCode = locationCodeRepository.findByCode(request.getCode())
-                .orElseGet(() -> {
-                    LocationCode newCode = LocationCode.builder()
-                            .code(request.getCode())
-                            .status(1)
-                            .build();
-                    return locationCodeRepository.save(newCode);
-                });
-
-        if (locationCode.getShelfId() != null) {
-            throw new BusinessException("货位编码已被其他货架绑定");
+        // 2) 再锁目标编码行（锁序固定为“货架 → 编码(id 升序)”，无死锁环）。
+        //    两人同时把同一编码绑到两架空架：两人各持各的货架锁，在编码行上排队，
+        //    先到者提交后，后到者的锁定读拿到的是锁内最新行，shelf_id 已被占用 → 必然失败。
+        Long targetCodeId = locationCodeRepository.findIdByCode(code).orElse(null);
+        LocationCode locationCode;
+        if (targetCodeId != null) {
+            LocationCode target = locationCodeRepository
+                    .findByIdsForUpdateOrderByIdAsc(List.of(targetCodeId))
+                    .get(0);
+            if (target.getShelfId() != null) {
+                // 并发双绑里后提交的一方就在这里出局：不写绑定关系、不写流水，先到那架原样不动
+                throw new BusinessException("货位编码已被其他货架绑定");
+            }
+            locationCode = target;
+        } else {
+            // 系统中还没有该编码：直接插入并立即刷库，由 location_code.code 唯一约束裁决。
+            // 两笔并发同时新建同一编码时，先到者插入成功；后到者撞唯一约束（这里不预先加
+            // gap lock——两边各持一把兼容 gap lock 再插入反而会触发 1213 死锁）。
+            // 唯一约束冲突发生后事务已被标记 rollback-only，不能吞掉继续走，
+            // 翻译成业务提示让整笔回滚：先到那架的绑定关系与绑定流水保持不变。
+            try {
+                locationCode = locationCodeRepository.saveAndFlush(LocationCode.builder()
+                        .code(code)
+                        .status(1)
+                        .build());
+            } catch (DataIntegrityViolationException e) {
+                throw new BusinessException(409, "并发操作冲突：货位编码 " + code
+                        + " 刚被另一笔操作绑定，本笔绑定失败，原绑定保持不变");
+            }
         }
 
-        locationCode.setShelfId(request.getShelfId());
+        locationCode.setShelfId(shelf.getId());
         locationCode.setStatus(2);
-        locationCodeRepository.save(locationCode);
+        locationCodeRepository.saveAndFlush(locationCode);
 
-        saveChangeLog(shelf.getId(), shelf.getShelfNo(), null, request.getCode(), OPERATION_BIND,
+        // 3) 绑定关系与流水同一事务原子提交：要么绑定+流水一起可见，要么整笔回滚两处都不动。
+        //    导出对照表/按编码反查/变更流水三处读的都是同一份已提交现状，不会再互相对不上。
+        saveChangeLog(shelf.getId(), shelf.getShelfNo(), null, code, OPERATION_BIND,
                 request.getOperator(), request.getRemark());
 
         return buildShelfResponse(shelf, locationCode, loadOccupancy(shelf.getId()));
@@ -184,20 +223,30 @@ public class ShelfServiceImpl implements ShelfService {
     @Override
     @Transactional
     public ShelfResponse unbindCode(Long shelfId, String operator, String remark) {
-        // 先锁货架行，与并发落架互斥，防止“一边落架一边解绑”
+        // 先锁货架行，与并发落架及同架改码操作互斥
         Shelf shelf = shelfRepository.findByIdForUpdate(shelfId)
                 .orElseThrow(() -> new BusinessException("货架不存在"));
 
-        LocationCode locationCode = locationCodeRepository.findByShelfId(shelfId)
-                .orElseThrow(() -> new BusinessException("货架未绑定货位编码"));
+        LocationCode locationCode = locationCodeRepository.findByShelfId(shelfId).orElse(null);
+        if (locationCode == null) {
+            throw new BusinessException("货架未绑定货位编码");
+        }
+
+        // 再锁编码行并复核归属：另一货架的并发重分配可能已把该码迁走，那时本架实际已无码
+        LocationCode locked = locationCodeRepository
+                .findByIdsForUpdateOrderByIdAsc(List.of(locationCode.getId()))
+                .get(0);
+        if (!shelfId.equals(locked.getShelfId())) {
+            throw new BusinessException(409, "并发操作冲突：该编码的绑定状态已被另一笔操作变更，请刷新后重试");
+        }
 
         assertNoActivePallet(shelfId, "解绑货位编码");
 
-        String oldCode = locationCode.getCode();
+        String oldCode = locked.getCode();
 
-        locationCode.setShelfId(null);
-        locationCode.setStatus(1);
-        locationCodeRepository.save(locationCode);
+        locked.setShelfId(null);
+        locked.setStatus(1);
+        locationCodeRepository.save(locked);
 
         saveChangeLog(shelf.getId(), shelf.getShelfNo(), oldCode, null, OPERATION_UNBIND,
                 operator, remark);
@@ -208,25 +257,62 @@ public class ShelfServiceImpl implements ShelfService {
     @Override
     @Transactional
     public ShelfResponse reassignCode(CodeReassignRequest request) {
-        // 同样先锁货架行，有在架托盘一律不允许重分配，必须先下架退回承重
+        // 1) 先锁目标货架行：同架的一切改码/落架操作在此串行，持锁后的普通读对本架状态是权威的
         Shelf shelf = shelfRepository.findByIdForUpdate(request.getShelfId())
                 .orElseThrow(() -> new BusinessException("货架不存在"));
 
-        LocationCode oldCode = locationCodeRepository.findByShelfId(request.getShelfId()).orElse(null);
+        LocationCode oldCode = locationCodeRepository.findByShelfId(shelf.getId()).orElse(null);
 
-        assertNoActivePallet(request.getShelfId(), "重分配货位编码");
+        assertNoActivePallet(shelf.getId(), "重分配货位编码");
 
-        LocationCode newCode = locationCodeRepository.findByCode(request.getNewCode())
-                .orElseGet(() -> {
-                    LocationCode code = LocationCode.builder()
-                            .code(request.getNewCode())
-                            .status(1)
-                            .build();
-                    return locationCodeRepository.save(code);
-                });
+        Long newCodeId = locationCodeRepository.findIdByCode(request.getNewCode()).orElse(null);
+        if (oldCode != null && oldCode.getId().equals(newCodeId)) {
+            throw new BusinessException("新货位编码与当前绑定编码相同，无需重分配");
+        }
 
-        if (newCode.getShelfId() != null && !newCode.getShelfId().equals(request.getShelfId())) {
-            throw new BusinessException("新货位编码已被其他货架绑定");
+        // 2) 再按 id 升序锁旧码/新码两行（新码不存在则交给 code 唯一约束裁决并发插入）。
+        //    货架→编码单向加锁、编码按 id 升序，两个互换编码的重分配事务也不会互等成环。
+        List<Long> codeIds = new ArrayList<>(2);
+        if (oldCode != null) {
+            codeIds.add(oldCode.getId());
+        }
+        if (newCodeId != null) {
+            codeIds.add(newCodeId);
+        }
+        Map<Long, LocationCode> lockedMap = codeIds.isEmpty()
+                ? Collections.emptyMap()
+                : locationCodeRepository.findByIdsForUpdateOrderByIdAsc(codeIds).stream()
+                        .collect(Collectors.toMap(LocationCode::getId, c -> c));
+
+        // 3) 持锁后按最新行复核。另一货架的并发重分配可能已动过这两个编码行
+        if (oldCode != null) {
+            LocationCode oldLocked = lockedMap.get(oldCode.getId());
+            if (oldLocked == null || !shelf.getId().equals(oldLocked.getShelfId())) {
+                throw new BusinessException(409, "并发操作冲突：原编码的绑定状态已被另一笔操作变更，请刷新后重试");
+            }
+            oldCode = oldLocked;
+        }
+
+        LocationCode newCode;
+        if (newCodeId != null) {
+            newCode = lockedMap.get(newCodeId);
+            if (newCode.getShelfId() != null && !newCode.getShelfId().equals(shelf.getId())) {
+                // 后到的一笔：目标编码已被先提交的并发事务挂到别架，本笔失败，旧绑定与流水不变
+                throw new BusinessException("新货位编码已被其他货架绑定");
+            }
+        } else {
+            // 新码不存在：直接插入并立即刷库，由 code 唯一约束裁决并发新建
+            // （不预加 gap lock——两边各持一把兼容 gap lock 再插入反而会触发 1213 死锁）。
+            // 冲突后事务已被标记 rollback-only，翻译成业务提示并整笔回滚，旧绑定与流水不变。
+            try {
+                newCode = locationCodeRepository.saveAndFlush(LocationCode.builder()
+                        .code(request.getNewCode())
+                        .status(1)
+                        .build());
+            } catch (DataIntegrityViolationException e) {
+                throw new BusinessException(409, "并发操作冲突：货位编码 " + request.getNewCode()
+                        + " 刚被另一笔操作绑定，本笔重分配失败，原绑定保持不变");
+            }
         }
 
         if (oldCode != null) {
@@ -235,10 +321,12 @@ public class ShelfServiceImpl implements ShelfService {
             locationCodeRepository.save(oldCode);
         }
 
-        newCode.setShelfId(request.getShelfId());
+        newCode.setShelfId(shelf.getId());
         newCode.setStatus(2);
         locationCodeRepository.save(newCode);
 
+        // 旧码释放、新码绑定与流水同一事务原子提交，
+        // 提交后导出对照表/按编码反查/变更流水看到的必然是同一套现状
         saveChangeLog(shelf.getId(), shelf.getShelfNo(),
                 oldCode != null ? oldCode.getCode() : null,
                 request.getNewCode(), OPERATION_REASSIGN,
