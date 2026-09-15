@@ -2,12 +2,17 @@ package com.coldchain.controller;
 
 import com.coldchain.dto.request.CodeBindRequest;
 import com.coldchain.dto.request.CodeReassignRequest;
+import com.coldchain.dto.request.PalletLandRequest;
+import com.coldchain.dto.request.PalletRemoveRequest;
 import com.coldchain.dto.request.ShelfCreateRequest;
 import com.coldchain.dto.response.ApiResponse;
 import com.coldchain.dto.response.CodeMappingResponse;
+import com.coldchain.dto.response.PalletOccupancyResponse;
+import com.coldchain.dto.response.ShelfOccupancyResponse;
 import com.coldchain.dto.response.ShelfResponse;
 import com.coldchain.dto.response.ZoneTreeResponse;
 import com.coldchain.entity.CodeChangeLog;
+import com.coldchain.entity.PalletOccupancy;
 import com.coldchain.service.ShelfService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -103,16 +108,49 @@ public class ShelfController {
     @GetMapping("/export")
     public ResponseEntity<byte[]> exportCodeMapping() {
         String csv = shelfService.exportCodeMapping();
-        
+
         byte[] bytes = csv.getBytes(StandardCharsets.UTF_8);
-        
+
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.parseMediaType("text/csv; charset=UTF-8"));
         headers.setContentDispositionFormData("attachment", "shelf_code_mapping.csv");
         headers.setContentLength(bytes.length);
-        
+
         return ResponseEntity.ok()
                 .headers(headers)
                 .body(bytes);
+    }
+
+    // ===================== 托盘落架占用 =====================
+
+    /** 托盘落架登记：托盘号、毛重、落在哪一架 */
+    @PostMapping("/pallets/land")
+    public ApiResponse<ShelfOccupancyResponse> landPallet(@Valid @RequestBody PalletLandRequest request) {
+        return ApiResponse.success("落架成功", shelfService.landPallet(request));
+    }
+
+    /** 托盘下架：承重退回 */
+    @PostMapping("/pallets/remove")
+    public ApiResponse<ShelfOccupancyResponse> removePallet(@Valid @RequestBody PalletRemoveRequest request) {
+        return ApiResponse.success("下架成功，承重已退回", shelfService.removePallet(request));
+    }
+
+    /** 单架占用详情（额定/在架合计/剩余/托盘明细） */
+    @GetMapping("/{shelfId}/occupancy")
+    public ApiResponse<ShelfOccupancyResponse> getShelfOccupancy(@PathVariable Long shelfId) {
+        return ApiResponse.success(shelfService.getShelfOccupancy(shelfId));
+    }
+
+    /** 全部在架托盘，可按货架编号过滤 */
+    @GetMapping("/pallets/active")
+    public ApiResponse<List<PalletOccupancyResponse>> getActivePallets(
+            @RequestParam(required = false) String shelfNo) {
+        return ApiResponse.success(shelfService.getActivePallets(shelfNo));
+    }
+
+    /** 托盘号落架/下架历史 */
+    @GetMapping("/pallets/history")
+    public ApiResponse<List<PalletOccupancy>> getPalletHistory(@RequestParam String palletNo) {
+        return ApiResponse.success(shelfService.getPalletHistory(palletNo));
     }
 }

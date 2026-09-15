@@ -37,3 +37,34 @@ CREATE TABLE IF NOT EXISTS code_change_log (
     INDEX idx_operation_type (operation_type),
     FOREIGN KEY (shelf_id) REFERENCES shelf(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='编码变更记录表';
+
+-- 托盘落架占用流水：一次落架一条，在架=1、已下架=2，永久保留用于台账与追溯
+CREATE TABLE IF NOT EXISTS pallet_occupancy (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '占用流水ID',
+    pallet_no VARCHAR(50) NOT NULL COMMENT '托盘号',
+    shelf_id BIGINT NOT NULL COMMENT '落架货架ID',
+    shelf_no VARCHAR(50) NOT NULL COMMENT '落架货架编号（冗余快照）',
+    gross_weight DECIMAL(10,2) NOT NULL COMMENT '毛重(kg)',
+    status TINYINT NOT NULL DEFAULT 1 COMMENT '状态：1在架 2已下架',
+    landed_at DATETIME NOT NULL COMMENT '落架时间',
+    landed_by VARCHAR(50) COMMENT '落架操作人',
+    land_remark VARCHAR(255) COMMENT '落架备注',
+    removed_at DATETIME COMMENT '下架时间',
+    removed_by VARCHAR(50) COMMENT '下架操作人',
+    remove_remark VARCHAR(255) COMMENT '下架备注',
+    INDEX idx_pallet_shelf_id (shelf_id),
+    INDEX idx_pallet_pallet_no (pallet_no),
+    INDEX idx_pallet_status (status),
+    INDEX idx_pallet_landed_at (landed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='托盘落架占用流水表';
+
+-- 在架托盘登记：仅保留当前在架托盘，主键=托盘号，数据库层保证同一托盘全局只能在架一次
+CREATE TABLE IF NOT EXISTS pallet_active (
+    pallet_no VARCHAR(50) PRIMARY KEY COMMENT '托盘号（在架全局唯一）',
+    occupancy_id BIGINT NOT NULL COMMENT '对应落架流水ID（逻辑关联，不外键约束）',
+    shelf_id BIGINT NOT NULL COMMENT '当前所在货架ID',
+    shelf_no VARCHAR(50) NOT NULL COMMENT '当前所在货架编号',
+    landed_at DATETIME NOT NULL COMMENT '落架时间',
+    INDEX idx_active_shelf_id (shelf_id),
+    INDEX idx_active_occupancy_id (occupancy_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='在架托盘登记表';
