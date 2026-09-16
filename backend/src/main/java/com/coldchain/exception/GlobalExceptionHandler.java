@@ -37,14 +37,15 @@ public class GlobalExceptionHandler {
 
     /**
      * 唯一约束冲突：典型场景一是两个并发请求把同一个托盘号同时落架，后到者撞 pallet_active 主键；
-     * 二是两笔并发绑定系统中尚不存在的同一货位编码，后到者撞 location_code.code 唯一约束。
-     * 冲突方整笔回滚，先前已提交的绑定/落架和流水保持不变，翻译为业务提示而不是 500。
+     * 二是两笔并发绑定系统中尚不存在的同一货位编码，后到者撞 location_code.code 唯一约束；
+     * 三是同一库区两笔并发开班，后到者撞“进行中库区唯一”部分唯一索引（行锁之外的数据库兜底）。
+     * 冲突方整笔回滚，先前已提交的绑定/落架/开班和流水保持不变，翻译为业务提示而不是 500。
      */
     @ExceptionHandler(DataIntegrityViolationException.class)
     @ResponseStatus(HttpStatus.OK)
     public ApiResponse<Void> handleDataIntegrityViolation(DataIntegrityViolationException e) {
         log.warn("Data integrity violation: {}", e.getMostSpecificCause().getMessage());
-        return ApiResponse.error(409, "并发操作冲突：该编码或托盘可能已被另一笔操作登记，本笔失败，现状保持不变");
+        return ApiResponse.error(409, "并发操作冲突：该编码/托盘/库区开班可能已被另一笔操作登记，本笔失败，现状保持不变");
     }
 
     /**

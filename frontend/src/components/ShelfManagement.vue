@@ -45,6 +45,7 @@ import {
   type PalletOccupancy,
   type ShelfOccupancy
 } from '@/api/shelf'
+import ShiftHandover from './ShiftHandover.vue'
 
 const shelves = ref<Shelf[]>([])
 const zoneTree = ref<ZoneTree[]>([])
@@ -58,7 +59,7 @@ const palletFilterShelfNo = ref('')
 
 const searchCode = ref('')
 const searchResult = ref<Shelf | null>(null)
-const activeTab = ref('list')
+const activeTab = ref('shift')
 
 const showCreateDialog = ref(false)
 const showBindDialog = ref(false)
@@ -532,6 +533,10 @@ onMounted(() => {
 
     <div class="main-content">
       <ElTabs v-model="activeTab" type="card" class="main-tabs" @tab-change="loadActivePallets">
+        <ElTabPane label="库区交接班" name="shift" lazy>
+          <ShiftHandover />
+        </ElTabPane>
+
         <ElTabPane label="货架列表" name="list">
           <div class="search-bar">
             <div class="code-search">

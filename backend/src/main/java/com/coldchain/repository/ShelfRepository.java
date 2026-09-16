@@ -28,6 +28,10 @@ public interface ShelfRepository extends JpaRepository<Shelf, Long> {
 
     List<Shelf> findAllByOrderByZoneAscShelfNoAsc();
 
+    /** 全部已建档货架涉及的去重库区（交接班总览用，按库区名排序） */
+    @Query("select distinct s.zone from Shelf s order by s.zone asc")
+    List<String> findDistinctZone();
+
     /**
      * 行级悲观写锁（MySQL: SELECT ... FOR UPDATE）。
      * 落架/下架/解绑/重分配/删除货架等需要变更“该货架占用状态”的事务，

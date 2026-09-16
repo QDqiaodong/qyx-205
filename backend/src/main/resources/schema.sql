@@ -68,3 +68,52 @@ CREATE TABLE IF NOT EXISTS pallet_active (
     INDEX idx_active_shelf_id (shelf_id),
     INDEX idx_active_occupancy_id (occupancy_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='在架托盘登记表';
+
+-- ===================== 库区交接班 =====================
+
+-- 库区开班串行锁：每个库区一行，开班事务先对本行 SELECT ... FOR UPDATE，
+-- 保证同一库区的并发开班完全串行：上一班没交完，后来的新班必然被拦住
+CREATE TABLE IF NOT EXISTS shift_zone_lock (
+    zone VARCHAR(50) PRIMARY KEY COMMENT '库区名称（每库区一行）'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库区开班串行锁表';
+
+-- 交接班主表：一班一条，按库区串行；status 1进行中 2已交班（已交班整班冻结）
+CREATE TABLE IF NOT EXISTS shift_handover (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '班次ID（点检/流水/反查三处对齐同一班）',
+    zone VARCHAR(50) NOT NULL COMMENT '库区',
+    shift_type VARCHAR(10) NOT NULL COMMENT '班次：白班/夜班',
+    status TINYINT NOT NULL DEFAULT 1 COMMENT '状态：1进行中 2已交班（冻结）',
+    outgoing_name VARCHAR(50) NOT NULL COMMENT '当班人（开班人/交班责任人）',
+    incoming_name VARCHAR(50) COMMENT '接班人（交班时必填，不得与当班人同名）',
+    seal_no VARCHAR(100) COMMENT '铅封号（交班前必填，交班后不得清空）',
+    handover_note VARCHAR(500) COMMENT '交班说明（口头交代落纸面）',
+    opened_at DATETIME NOT NULL COMMENT '开班时间',
+    handed_at DATETIME COMMENT '交班成功时间',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    INDEX idx_shift_zone (zone),
+    INDEX idx_shift_status (status),
+    INDEX idx_shift_zone_status (zone, status),
+    INDEX idx_shift_handed_at (handed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库区交接班主表';
+
+-- 数据库层兜底：同一库区最多只能有一条进行中(status=1)的班。
+-- 已交班行的 active_zone 为 NULL，MySQL 唯一索引中多个 NULL 不冲突。
+CREATE UNIQUE INDEX uk_shift_zone_active
+    ON shift_handover ((CASE WHEN status = 1 THEN zone ELSE NULL END));
+
+-- 交接班必检项明细：一班三条（外观/门帘/铅封），checked=1 才算勾齐
+CREATE TABLE IF NOT EXISTS shift_check_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '明细ID',
+    shift_id BIGINT NOT NULL COMMENT '所属班次ID',
+    item_code VARCHAR(32) NOT NULL COMMENT '必检项编码：APPEARANCE/DOOR_CURTAIN/SEAL',
+    item_name VARCHAR(100) NOT NULL COMMENT '必检项名称（快照）',
+    checked TINYINT NOT NULL DEFAULT 0 COMMENT '是否勾选：0未勾 1已勾',
+    checked_at DATETIME COMMENT '最后勾选时间',
+    remark VARCHAR(255) COMMENT '点检备注',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    INDEX idx_check_shift_id (shift_id),
+    CONSTRAINT fk_check_shift FOREIGN KEY (shift_id)
+        REFERENCES shift_handover(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='交接班必检项明细表';
